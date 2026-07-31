@@ -1,0 +1,44 @@
+name: rtl-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  reference-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pytest
+      - run: python -m pytest -q tests/test_reference_model.py
+
+  rtl-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y iverilog
+      - run: python -m pip install --upgrade pip "cocotb<2" pytest
+      - name: Compile integrated public core
+        run: |
+          iverilog -g2012 -Wall \
+            -s fpga_stream10g_core \
+            -o /tmp/fpga_stream10g_core.vvp \
+            rtl/rx/ipv4_udp_rx.sv \
+            rtl/tx/ipv4_udp_tx.sv \
+            rtl/fpga_stream10g_core.sv
+      - name: Elastic-buffer regression
+        run: make -C tests TOPLEVEL=axis_elastic_buffer MODULE=test_axis_elastic_buffer
+      - name: UDP TX regression
+        run: make -C tests clean TOPLEVEL=ipv4_udp_tx MODULE=test_ipv4_udp_tx && make -C tests TOPLEVEL=ipv4_udp_tx MODULE=test_ipv4_udp_tx
+      - name: UDP RX regression
+        run: make -C tests clean TOPLEVEL=ipv4_udp_rx MODULE=test_ipv4_udp_rx && make -C tests TOPLEVEL=ipv4_udp_rx MODULE=test_ipv4_udp_rx
+      - name: ARP TX regression
+        run: make -C tests clean TOPLEVEL=arp_tx MODULE=test_arp_tx && make -C tests TOPLEVEL=arp_tx MODULE=test_arp_tx
+      - name: ARP RX regression
+        run: make -C tests clean TOPLEVEL=arp_rx MODULE=test_arp_rx && make -C tests TOPLEVEL=arp_rx MODULE=test_arp_rx

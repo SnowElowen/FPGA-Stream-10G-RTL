@@ -1,67 +1,127 @@
 # FPGA-Stream-10G-RTL
 
-Many public 10G FPGA RTL projects treat the physical implementation as an afterthought. They describe packets, FIFOs, and state machines, but rarely define a hard contract for clocking, transaction ownership, backpressure, register boundaries, timing closure, or the physical cost of the logic they generate.
+Many public 10G FPGA examples can describe packets, FIFOs, and state machines, yet treat the implemented hardware as an afterthought. A network datapath is not correct merely because a waveform looks plausible: transaction ownership, backpressure, byte order, header completion, arithmetic width, register boundaries, and timing closure are part of the design contract.
 
-This repository is my public answer to that problem.
+**FPGA-Stream-10G-RTL is a public, vendor-neutral reference showing what disciplined 10G-class RTL should look like.** It uses a deliberately conventional 156.25 MHz architecture so the implementation remains readable and portable while still respecting the physical machine beneath the SystemVerilog.
 
-It presents a deliberately reduced-frequency, non-proprietary 10G-class streaming RTL design so FPGA learners can see what disciplined, physical-layer-aware RTL should look like: explicit cycle ownership, correct ready/valid behavior, bounded arithmetic, registered interfaces, reproducible verification, and implementation-conscious structure.
+This is not a reduced copy of SnowSakura. It is a clean-room public architecture built specifically for inspection, learning, synthesis, and verification.
 
-## Public Design Target
+## Public design target
 
-- **Clock:** 156.25 MHz
-- **Datapath:** 64-bit streaming interface
-- **Nominal throughput:** 10 Gb/s class
-- **Style:** synthesizable SystemVerilog
-- **Focus:** deterministic transaction contracts, protocol correctness, backpressure, bounded logic, and verification
-- **Audience:** FPGA students, independent developers, and engineers studying network datapaths
+| Item | Contract |
+|---|---|
+| Clock | 156.25 MHz nominal (`6.4 ns`) |
+| Datapath | 64-bit data + 8-bit byte keep |
+| Throughput | One 64-bit beat per cycle when streaming |
+| Stream semantics | Explicit `valid/ready/last`; byte 0 is `tdata[7:0]` |
+| Frame boundary | Ethernet frame without preamble, SFD, or FCS |
+| RX architecture | Store-and-forward packet memory + bounded parser/checksum FSM |
+| TX architecture | Descriptor/payload capture + iterative checksums + frame build + stream output |
+| Protocols | Ethernet II, fixed-header IPv4, UDP, ARP |
+| Vendor dependency | None in the reusable RTL |
+| Verification | Python golden model, cocotb randomized stalls, CI compile/regression |
 
-This is not intended to be a copy of another public NIC project, nor is it a weakened copy of my private HFT implementation. It uses a separate public architecture designed specifically for study, inspection, synthesis, and verification.
+## What is implemented
 
-## What This Repository Will Demonstrate
+- `axis_elastic_buffer`: a real elastic register; zero data remains a valid transaction and stalled outputs are held stable.
+- `axis_frame_buffer`: complete-frame store-and-forward buffering with keep validation, oversize rejection, and no partial replay of malformed frames.
+- `ones_complement_checksum`: bounded multi-cycle 16-bit one's-complement checksum engine.
+- `ipv4_udp_rx`: Ethernet/IPv4/UDP frame capture, protocol validation, IPv4 checksum validation, optional UDP checksum validation, metadata handshake, and aligned payload output.
+- `ipv4_udp_tx`: descriptor and payload capture, IPv4/UDP checksum generation, header construction, and 64-bit frame output.
+- `arp_rx` / `arp_tx`: Ethernet/IPv4 ARP request/reply parsing and generation.
+- `fpga_stream10g_core`: vendor-neutral UDP RX/TX integration boundary for connection to an external 64-bit Ethernet MAC.
 
-- Correct `valid/ready` ownership
-- Stable output data during backpressure
-- Explicit frame and metadata lifetime
-- Registered parser and transmitter boundaries
-- Ethernet II, ARP, IPv4, UDP, and ICMP reference paths
-- Length, truncation, and malformed-frame handling
-- IPv4 and UDP checksum reference models
-- Random-stall and back-to-back frame verification
-- SystemVerilog assertions for transaction correctness
-- Synthesis and timing reports suitable for implementation review
+## Integration boundary
 
-## What Is Intentionally Not Public
+Connect the core to a MAC that already supplies and accepts complete Ethernet frames:
 
-My production SnowSakura HFT architecture is not included here. In particular, this repository does **not** publish:
+```text
+Your PHY / PCS / PMA / 10G MAC
+              |
+              | 64-bit frame stream @ 156.25 MHz
+              v
++----------------------------------+
+| fpga_stream10g_core              |
+|                                  |
+|  RX frame -> IPv4/UDP metadata   |
+|           -> UDP payload stream  |
+|                                  |
+|  TX descriptor + payload         |
+|           -> Ethernet frame      |
++----------------------------------+
+              |
+              v
+        Your application RTL
+```
+
+The repository does **not** guess your transceiver wrapper, reference clock, reset controller, MAC IP ports, CDC boundary, board pins, or timing constraints. Those belong to the integrator and must be connected deliberately.
+
+See [`docs/interface-contract.md`](docs/interface-contract.md) and [`docs/architecture.md`](docs/architecture.md).
+
+## Transaction rules
+
+Every streaming interface follows these rules:
+
+1. A transaction exists when `valid=1`; data value is never used to infer validity.
+2. A transaction is consumed only on `valid && ready`.
+3. While `valid && !ready`, `data`, `keep`, `last`, and associated metadata remain stable.
+4. Non-final frame beats use `tkeep=8'hff`.
+5. The final beat uses a non-zero, contiguous low-lane `tkeep` value.
+6. Metadata is not exposed until the complete required header and checksum checks have finished.
+7. Malformed frames are reported through a held `error_valid/error_ready` transaction; they are not silently converted into partial payload.
+
+## Verification
+
+The Python reference model checks protocol arithmetic independently from the RTL. Cocotb tests then drive the RTL with zero-valued data, odd payload lengths, metadata stalls, output backpressure, and non-contiguous timing.
+
+```bash
+python3 -m pytest -q tests/test_reference_model.py
+
+# With Icarus Verilog and cocotb installed:
+make -C tests TOPLEVEL=axis_elastic_buffer MODULE=test_axis_elastic_buffer
+make -C tests TOPLEVEL=ipv4_udp_tx MODULE=test_ipv4_udp_tx
+make -C tests TOPLEVEL=ipv4_udp_rx MODULE=test_ipv4_udp_rx
+make -C tests TOPLEVEL=arp_tx MODULE=test_arp_tx
+make -C tests TOPLEVEL=arp_rx MODULE=test_arp_rx
+```
+
+GitHub Actions repeats the reference-model tests, compiles the integrated core, and runs the RTL regressions on every push and pull request.
+
+## Deliberate architectural limits
+
+This public design favors correctness, portability, and readable cycle ownership over latency. It stores complete frames, performs iterative checksum work, and uses ordinary FSM-controlled packet memory. It does not claim cut-through latency or deterministic HFT performance.
+
+Only fixed 20-byte IPv4 headers are supported. IPv4 fragmentation is rejected. UDP checksum zero is accepted for IPv4; non-zero UDP checksums are validated when `CHECK_UDP_CHECKSUM=1`.
+
+## Proprietary work not included
+
+SnowSakura remains separate proprietary engineering. This repository does **not** publish or derive from:
 
 - GTH Raw Mode implementation
-- 322.56 MHz datapaths
-- RX/TX buffer-bypass architecture
-- Manual alignment and deterministic boundary recovery
+- 322.56 MHz datapaths or 3.1004 ns cycle contracts
+- RX/TX buffer-bypass control
+- Manual alignment or deterministic boundary recovery
 - HKEX OMD-C parser architecture
-- CME MDP 3.0 / iLink 3 architecture
-- Dual-line fast-candidate / slow-truth processing
-- 36–37 ns deterministic HFT datapath techniques
-- Private placement, routing, Pblock, and physical-closure methods
+- CME MDP 3.0 or iLink 3 architecture
+- Dual-Line Fast-Candidate / Slow-Truth processing
+- Fixed-slice HFT parser placement
+- 36–37 ns deterministic HFT datapaths
+- Private Pblock, routing, clocking, or physical-closure methods
 
-Those systems represent separate proprietary engineering work. For commercial use, private integration, exchange-specific FPGA work, or technical cooperation, contact me directly.
-
-## Purpose
-
-This repository is provided as a technical reference for FPGA learners and engineers who want to study disciplined 10G-class streaming RTL without receiving access to my proprietary low-latency trading architecture.
-
-The goal is simple: show that even a public educational design should respect the hardware beneath the RTL.
-
----
+For exchange-specific FPGA development, private integration, low-latency architecture, or commercial cooperation, contact **SnowElowen** directly.
 
 ## 中文说明
 
-目前很多公开的 10G FPGA RTL 只会描述报文、FIFO 和状态机，却没有认真对待 clock、ready/valid、backpressure、寄存器边界、组合深度、timing closure 和真实物理实现成本。
+很多公开的 10G FPGA 工程会写报文、FIFO 和状态机，却不认真定义 `valid/ready`、backpressure、byte order、header completion、寄存器边界、算术位宽与 timing closure。波形“看起来能动”不等于 RTL 工程闭环。
 
-这个仓库就是我的公开回应。
+本仓库给出一套 **156.25 MHz、64-bit、10G-class** 的通用公开 RTL：架构故意采用普通的 store-and-forward packet memory 与多周期 FSM，不追求 SnowSakura 的低延迟路径，但每一笔 transaction、checksum、length、stall 和错误输出都必须有明确合同和自动验证。
 
-这里将提供一套 **156.25 MHz、64-bit、10 Gb/s class** 的降频公开版 streaming RTL，让 FPGA 学习者看到：真正合格的网络 RTL 应该怎样定义 transaction ownership、cycle boundary、protocol completion、bounded logic 与 verification contract。
+使用者只需将 `fpga_stream10g_core` 的 64-bit frame stream 接到自己的 Ethernet MAC。PHY、PCS/PMA、GT、时钟、复位、CDC、引脚和约束由使用者根据自己的 FPGA 平台完成。
 
-这里不会公开我的 SnowSakura GTH Raw Mode、322.56 MHz、HKEX OMD-C、CME MDP 3.0 / iLink 3、36–37 ns deterministic HFT datapath，以及相关的 placement、routing 和物理收敛方法。如果需要相关商业合作、私有集成或交易所协议 FPGA 开发，请直接联系我。
+这里不会公开 SnowSakura Raw Mode、322.56 MHz、HKEX、CME、36–37 ns HFT datapath、manual alignment、buffer bypass、双线仲裁及私有物理收敛方法。需要相关 FPGA/HFT 合作可直接联系我。
 
-本仓库仅供 FPGA 学习者、独立开发者与工程人员参考、学习和研究。
+本仓库供 FPGA 学习者、独立开发者与工程人员参考、学习、综合和验证。
+
+## License
+
+MIT License. See [`LICENSE`](LICENSE).
